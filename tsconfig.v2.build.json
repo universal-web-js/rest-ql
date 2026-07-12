@@ -1,0 +1,8 @@
+{
+  "extends": "./tsconfig.v2.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "declaration": true,
+    "outDir": "./dist/v2"
+  }
+}

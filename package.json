@@ -8,7 +8,10 @@
     "build": "tsc",
     "eslint": "eslint '**/*.{ts,js}'",
     "start": "tsc --watch",
-    "test": "vitest"
+    "test": "vitest",
+    "bench": "tsx bench/benchmark.mjs",
+    "test:v2:types": "tsc -p tsconfig.v2.json",
+    "build:v2": "tsc -p tsconfig.v2.build.json"
   },
   "keywords": [
     "rest",
@@ -38,6 +41,7 @@
     "eslint-plugin-import": "^2.29.1",
     "eslint-plugin-n": "^17.10.2",
     "eslint-plugin-promise": "^7.1.0",
+    "tsx": "^4.19.0",
     "typescript": "^4.5.3",
     "vitest": "^2.0.5"
   },

@@ -504,3 +504,96 @@ RestQL is MIT licensed.
 This markdown provides an introduction to your RestQL project, highlighting its key features, providing a quick start guide, and showing some advanced usage examples. You may want to adjust the content based on the specific details of your implementation, add more examples, or include additional sections as needed.
 
 Remember to create the referenced files like `CONTRIBUTING.md` and `LICENSE`, and replace `link-to-your-docs` with the actual link to your documentation if you have one.
+
+---
+
+# RestQL v2 (preview) — One IR, Three Producers
+
+> **RestQL v2 has no query language to learn. The query language is a compiler target.**
+
+v2 replaces string-based queries with a compiled execution model: you describe data
+relationships, the planner computes a parallel execution graph, and the executor runs
+it with automatic deduplication and partial-failure semantics.
+
+```
+Typed Builder ──┐
+AI Codegen ─────┼──▶  IR (JSON graph)  ──▶  Planner  ──▶  Executor  ──▶  Typed Result
+OpenAPI Import ─┘        validated           waves         dedup
+```
+
+## Quickstart
+
+```ts
+import { query, http, from, plan, execute, fetchTransport } from 'lib-restql/v2'
+
+const built = query()
+  .node('user',          http.get('/users/{id}', { id: 1 }))
+  .node('orders',        http.get('/users/{userId}/orders').bind('userId', from('user', 'id')))
+  .node('cart',          http.get('/users/{userId}/cart').bind('userId', from('user', 'id')))
+  .node('notifications', http.get('/users/{userId}/notifications').bind('userId', from('user', 'id')))
+  .node('payments',      http.get('/orders/{orderId}/payments').bind('orderId', from('orders', 'items[0].id')))
+  .build()                       // → validated IR; a builder can never emit an invalid graph
+
+if (built.ok) {
+  const planned = plan(built.value)              // → waves: [[user], [cart, notifications, orders], [payments]]
+  if (planned.ok) {
+    const result = await execute(planned.value, built.value, fetchTransport())
+    // result.nodes.orders → { status: 'ok', data: ... } | { status: 'error' } | { status: 'skipped' }
+    // result.meta         → { dedupedRequests, waves }
+  }
+}
+```
+
+No `Promise.all`. No manual dependency ordering. Dependency edges are derived from
+`bind()` calls; independent nodes run concurrently; identical in-flight requests are
+deduplicated; a failed node marks its dependents `skipped` while siblings succeed.
+
+## Architecture
+
+| Module | Responsibility |
+|---|---|
+| `src/v2/ir` | The IR: a flat, versioned, JSON-serializable node map with explicit `dependsOn` edges. `validate(unknown)` returns `Result`, never throws, collects all errors in one pass. |
+| `src/v2/plan` | Pure planner (Kahn's algorithm): IR → deterministic waves. Cycles are reported, never hung on. |
+| `src/v2/exec` | Wave executor: in-flight dedup keyed by `method + url`, binding resolution (`items[0].id` paths), partial success, abort signals. `Transport` is the **only** seam that touches the network. |
+| `src/v2/builder` | Immutable fluent builder. Constructs IR and nothing else — zero execution logic. |
+
+The IR is deliberately a *flat map with edges*, not a nested tree: trees cannot express
+diamond dependencies (`a → b,c → d`). Full design rationale, invariants, and the
+phased plan live in [`docs/rfc/rfc-0002-v2-core.md`](./docs/rfc/rfc-0002-v2-core.md).
+
+## Benchmarks
+
+Real `node:http` server, real `fetch`, 25 ms simulated latency per request,
+15 iterations + warmup. Run them yourself: `npm run bench`.
+
+**Profile page** — `user → (orders, cart, notifications)`, `orders → payments`:
+
+| Contender | p50 | Server-observed concurrency |
+|---|---|---|
+| Native fetch, naive sequential | 130.7 ms | 1 |
+| RestQL **v1** engine | 132.6 ms | 1 |
+| Native fetch, hand-optimized `Promise.all` | 79.7 ms | 3 |
+| RestQL **v2** engine | **79.9 ms** | 3 |
+
+v2 matches hand-optimized native fetch within noise (**+0.2 ms**) — you stop writing
+orchestration without paying for the abstraction. Engine overhead above the theoretical
+floor (waves × latency) is ~5 ms.
+
+**Breadth scaling** — K independent resources under `user`:
+
+| K | v1 p50 | v2 p50 | speedup |
+|---|---|---|---|
+| 2 | 81.3 ms | 52.7 ms | 1.5× |
+| 4 | 132.4 ms | 53.4 ms | 2.5× |
+| 6 | 184.7 ms | 55.4 ms | 3.3× |
+
+v1 resolves nested resources serially (O(K)); v2 stays at two waves regardless of K.
+**Dedup:** 6 nodes sharing one upstream → 1 network request (83% saved; v1 has no
+in-flight dedup).
+
+## Tests & build
+
+- `npm test` — 46 tests: 13 v1 characterization tests (lock existing behavior, quirks included), 28 v2 unit tests (IR / planner / executor / builder), 5 pre-existing BatchManager tests.
+- `npm run test:v2:types` — v2 under `strict` + `noUncheckedIndexedAccess` + `exactOptionalPropertyTypes`.
+- `npm run build:v2` — emits `dist/v2` with declarations.
+- **Zero regressions:** no v1 source file is modified. Note: `npm run build` (v1) has 29 pre-existing type errors on master, unchanged by this work; v1 behavior is pinned by the characterization suite.
