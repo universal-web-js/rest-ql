@@ -183,17 +183,42 @@ export class RestQLExecutor extends Logger {
 
     if (httpMethod === HttpMethod.GET) {
       url = this.appendQueryString(url, queryArgs)
+
+      // In-flight deduplication (GET only): identical concurrent requests
+      // share a single network call. Each consumer receives a clone so the
+      // body can be read independently. Mutations are never deduplicated.
+      const dedupKey = `${httpMethod} ${url}`
+      const inFlight = this.inFlightRequests.get(dedupKey)
+      if (inFlight) {
+        this.log(`Deduplicated in-flight request: ${dedupKey}`)
+        const sharedResponse = await inFlight
+        return this.assertOk(sharedResponse.clone(), url)
+      }
+
+      this.log(`Sending ${httpMethod} request to ${url}`)
+      const pending = fetch(url, requestOptions)
+      this.inFlightRequests.set(dedupKey, pending)
+      try {
+        const response = await pending
+        return this.assertOk(response.clone(), url)
+      } finally {
+        this.inFlightRequests.delete(dedupKey)
+      }
     }
 
     this.log(`Sending ${httpMethod} request to ${url}`)
     const response = await fetch(url, requestOptions)
+    return this.assertOk(response, url)
+  }
 
+  private readonly inFlightRequests = new Map<string, Promise<Response>>()
+
+  private assertOk (response: Response, url: string): Response {
     if (!response.ok) {
       const errorMessage = `Request to ${url} failed with status ${response.status}`
       this.error(errorMessage)
       throw new NetworkError(errorMessage)
     }
-
     return response
   }
 

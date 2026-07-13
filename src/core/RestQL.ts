@@ -380,78 +380,97 @@ export class RestQL extends Logger {
 
     const shapedData: any = {}
 
-    for (const [fieldName, fieldValue] of Object.entries(query.fields)) {
-      const fieldSchema = resourceSchema.fields?.[fieldName]
-      if (!fieldSchema) {
-        this.warn(
-          `Field schema for "${fieldName}" not found in resource schema. Skipping.`
-        )
-        continue
-      }
+    // Sibling fields resolve concurrently; dependency chains remain ordered by
+    // recursion (a nested resource's own fields resolve inside its subtree).
+    // Results are assigned in declaration order to keep output key order stable.
+    const fieldResults = await Promise.all(
+      Object.entries(query.fields).map(
+        async ([fieldName, fieldValue]): Promise<[string, any] | null> => {
+          const fieldSchema = resourceSchema.fields?.[fieldName]
+          if (!fieldSchema) {
+            this.warn(
+              `Field schema for "${fieldName}" not found in resource schema. Skipping.`
+            )
+            return null
+          }
 
-      const fromPath = fieldSchema.from || fieldName
-      let rawValue = this.extractNestedValue(data, fromPath)
+          const fromPath = fieldSchema.from || fieldName
+          let rawValue = this.extractNestedValue(data, fromPath)
 
-      try {
-        // Apply type coercion and nullability check
-        rawValue = this.coerceValue(rawValue, fieldSchema)
+          try {
+            // Apply type coercion and nullability check
+            rawValue = this.coerceValue(rawValue, fieldSchema)
 
-        if (
-          fieldSchema.isResource ||
-          this.schema[fieldSchema.type.toLowerCase()]
-        ) {
-          const nestedResourceSchema =
-            this.schema[fieldSchema.type.toLowerCase()]
-          if (nestedResourceSchema) {
-            const nestedQuery = {
-              queryName: fieldName,
-              args: fieldValue.args || {},
-              fields: fieldValue.fields
+            if (
+              fieldSchema.isResource ||
+              this.schema[fieldSchema.type.toLowerCase()]
+            ) {
+              const nestedResourceSchema =
+                this.schema[fieldSchema.type.toLowerCase()]
+              if (nestedResourceSchema) {
+                const nestedQuery = {
+                  queryName: fieldName,
+                  args: fieldValue.args || {},
+                  fields: fieldValue.fields
+                }
+                const nestedResult = await this.executeQueryField(
+                  fieldName,
+                  nestedQuery.fields,
+                  nestedQuery.args,
+                  variables,
+                  nestedResourceSchema
+                )
+                rawValue = nestedResult.shapedData
+              }
+            } else if (typeof fieldValue === 'object' && fieldValue.fields) {
+              const nestedType = fieldSchema.type.replace(/[\[\]!]/g, '')
+              const nestedSchema = this.schema._types[nestedType]
+              if (nestedSchema) {
+                rawValue = await this.shapeData(
+                  rawValue,
+                  { fields: fieldValue.fields },
+                  nestedSchema,
+                  variables,
+                  rawResponses
+                )
+              } else {
+                this.warn(`Schema not found for nested type: ${nestedType}`)
+              }
             }
-            const nestedResult = await this.executeQueryField(
-              fieldName,
-              nestedQuery.fields,
-              nestedQuery.args,
-              variables,
-              nestedResourceSchema
-            )
-            rawValue = nestedResult.shapedData
-          }
-        } else if (typeof fieldValue === 'object' && fieldValue.fields) {
-          const nestedType = fieldSchema.type.replace(/[\[\]!]/g, '')
-          const nestedSchema = this.schema._types[nestedType]
-          if (nestedSchema) {
-            rawValue = await this.shapeData(
-              rawValue,
-              { fields: fieldValue.fields },
-              nestedSchema,
-              variables,
-              rawResponses
-            )
-          } else {
-            this.warn(`Schema not found for nested type: ${nestedType}`)
-          }
-        }
 
-        if (fieldSchema.transform && this.transformers[fieldSchema.transform]) {
-          rawValue = this.transformers[fieldSchema.transform](
-            data,
-            { [fieldName]: rawValue },
-            rawResponses
-          )
-        }
+            if (
+              fieldSchema.transform &&
+              this.transformers[fieldSchema.transform]
+            ) {
+              rawValue = this.transformers[fieldSchema.transform](
+                data,
+                { [fieldName]: rawValue },
+                rawResponses
+              )
+            }
 
-        shapedData[fieldName] = rawValue
-      } catch (error) {
-        if (error instanceof ValidationError) {
-          this.error(`Validation error for field ${fieldName}:`, error.message)
-          if (!fieldSchema.isNullable) {
-            throw error
+            return [fieldName, rawValue]
+          } catch (error) {
+            if (error instanceof ValidationError) {
+              this.error(
+                `Validation error for field ${fieldName}:`,
+                error.message
+              )
+              if (!fieldSchema.isNullable) {
+                throw error
+              }
+              return [fieldName, null]
+            } else {
+              throw error
+            }
           }
-          shapedData[fieldName] = null
-        } else {
-          throw error
         }
+      )
+    )
+
+    for (const entry of fieldResults) {
+      if (entry) {
+        shapedData[entry[0]] = entry[1]
       }
     }
 
